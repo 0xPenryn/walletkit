@@ -29,7 +29,7 @@ use crate::commands::resolve_root;
 use crate::output;
 
 use super::{
-    bridge::{self, BridgeConnection, BridgeExtension},
+    bridge::{self, BridgeConnection},
     init_authenticator, resolve_built_config, resolve_test_rpc_url,
     resolve_verifier_address, Cli,
 };
@@ -104,6 +104,9 @@ pub enum ProofCommand {
         /// Owner-only exact request file written by `bridge-export`.
         #[arg(long)]
         request: PathBuf,
+        /// Owner-only request-extension array written by `bridge-export`.
+        #[arg(long)]
+        request_extensions: PathBuf,
         /// Owner-only stock proof file written by `bridge-export`.
         #[arg(long)]
         proof: PathBuf,
@@ -448,13 +451,15 @@ async fn run_bridge_export(
 }
 
 async fn run_bridge_submit(
-    cli: &Cli,
+    json_output: bool,
     bridge_url: &str,
     request_path: &Path,
+    request_extensions_path: &Path,
     proof_path: &Path,
     extension_responses_path: &Path,
 ) -> eyre::Result<()> {
     let exact_request = read_path(request_path)?;
+    let request_extensions_json = read_path(request_extensions_path)?;
     let proof_json = read_path(proof_path)?;
     let extension_responses_json = read_path(extension_responses_path)?;
     let core_request = CoreProofRequest::from_json(&exact_request)
@@ -464,28 +469,15 @@ async fn run_bridge_submit(
     core_request
         .validate_response(&proof_response)
         .wrap_err("stock proof response does not match the exact request")?;
-    let extension_responses: Vec<BridgeExtension> =
-        serde_json::from_str(&extension_responses_json)
-            .wrap_err("invalid extension response array")?;
+    let request_extensions = bridge::parse_extensions_json(&request_extensions_json)
+        .wrap_err("invalid request extension array")?;
+    let extension_responses = bridge::parse_extensions_json(&extension_responses_json)
+        .wrap_err("invalid extension response array")?;
 
     let connection = BridgeConnection::parse(bridge_url)?;
-    let client = bridge::http_client()?;
-    let bridge_request = bridge::fetch_request(&client, &connection).await?;
-    let configured_environment = cli
-        .authenticator_config
-        .is_none()
-        .then_some(cli.environment.as_str());
-    bridge_request.ensure_composition_supported(configured_environment)?;
-    eyre::ensure!(
-        bridge_request.exact_world_request_json()?.as_bytes()
-            == exact_request.as_bytes(),
-        "saved request bytes do not match the request currently held by this connector URL"
-    );
-    let bound_extension = bridge_request.bound_request_extension(&core_request)?;
-    bridge::validate_extension_responses(
-        bridge_request.request_extensions()?,
-        &extension_responses,
-    )?;
+    let bound_extension =
+        bridge::bound_request_extension(&request_extensions, &core_request)?;
+    bridge::validate_extension_responses(&request_extensions, &extension_responses)?;
     eyre::ensure!(
         extension_responses
             .iter()
@@ -497,13 +489,14 @@ async fn run_bridge_submit(
         .wrap_err("serialize validated stock proof response")?;
     let response_payload =
         bridge::extension_response_payload(&proof_value, &extension_responses)?;
+    let client = bridge::http_client()?;
     bridge::send_response(&client, &connection, &response_payload).await?;
 
     let response_names: Vec<&str> = extension_responses
         .iter()
         .map(|extension| extension.name.as_str())
         .collect();
-    if cli.json {
+    if json_output {
         output::print_json_data(
             &serde_json::json!({
                 "submitted": true,
@@ -809,11 +802,19 @@ pub async fn run(cli: &Cli, action: &ProofCommand) -> eyre::Result<()> {
         ProofCommand::BridgeSubmit {
             bridge_url,
             request,
+            request_extensions,
             proof,
             extension_responses,
         } => {
-            run_bridge_submit(cli, bridge_url, request, proof, extension_responses)
-                .await
+            run_bridge_submit(
+                cli.json,
+                bridge_url,
+                request,
+                request_extensions,
+                proof,
+                extension_responses,
+            )
+            .await
         }
         ProofCommand::GenerateTestRequest {
             issuer_schema_id,
@@ -850,6 +851,9 @@ pub async fn run(cli: &Cli, action: &ProofCommand) -> eyre::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::engine::general_purpose::STANDARD;
+    use world_id_core::primitives::{Nullifier, ZeroKnowledgeProof};
+    use world_id_core::requests::ResponseItem;
 
     #[test]
     fn private_bridge_outputs_are_exact_and_create_new() {
@@ -890,5 +894,110 @@ mod tests {
             .expect_err("duplicate path must fail before writing");
         assert!(error.to_string().contains("must be distinct"));
         assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn bridge_submit_uses_saved_extensions_without_refetching() {
+        let payload_json = r#"{"policy":"age_at_least"}"#;
+        let request = build_test_request(
+            &TestEnv::default_staging(),
+            879_789_934_843_693_818,
+            payload_json,
+            300,
+            ProofType::Uniqueness,
+            SessionRef::None,
+        )
+        .unwrap();
+        let request_item = &request.requests[0];
+        let proof_response = CoreProofResponse {
+            id: request.id.clone(),
+            version: request.version,
+            session_id: None,
+            error: None,
+            responses: vec![ResponseItem::new_uniqueness(
+                request_item.identifier.clone(),
+                request_item.issuer_schema_id,
+                ZeroKnowledgeProof::default(),
+                Nullifier::from(FieldElement::ZERO),
+                request_item.effective_expires_at_min(request.created_at),
+            )],
+        };
+        request.validate_response(&proof_response).unwrap();
+
+        let directory = tempfile::tempdir().unwrap();
+        let request_path = directory.path().join("request.json");
+        let request_extensions_path = directory.path().join("request-extensions.json");
+        let proof_path = directory.path().join("proof.json");
+        let extension_responses_path =
+            directory.path().join("extension-responses.json");
+        write_private_outputs(&[
+            (&request_path, request.to_json().unwrap().as_bytes()),
+            (
+                &request_extensions_path,
+                serde_json::to_string(&serde_json::json!([{
+                    "name": "org.worldcoin.passport.selective_disclosure.v1",
+                    "version": 1,
+                    "media_type": "application/json",
+                    "payload_json": payload_json,
+                }]))
+                .unwrap()
+                .as_bytes(),
+            ),
+            (
+                &proof_path,
+                serde_json::to_string(&proof_response).unwrap().as_bytes(),
+            ),
+            (
+                &extension_responses_path,
+                serde_json::to_string(&serde_json::json!([{
+                    "name": "org.worldcoin.passport.selective_disclosure.v1",
+                    "version": 1,
+                    "media_type": "application/json",
+                    "payload_json": "{\"proof\":\"opaque\"}",
+                }]))
+                .unwrap()
+                .as_bytes(),
+            ),
+        ])
+        .unwrap();
+
+        let key = STANDARD.encode([0x22; 32]);
+        let mut server = mockito::Server::new_async().await;
+        let bridge_origin =
+            url::form_urlencoded::byte_serialize(server.url().as_bytes())
+                .collect::<String>();
+        let connector_key =
+            url::form_urlencoded::byte_serialize(key.as_bytes()).collect::<String>();
+        let connector_url = format!(
+            "https://world.org/verify?t=wld&i=request-id&b={bridge_origin}&k={connector_key}"
+        );
+        let no_second_fetch = server
+            .mock("GET", "/request/request-id")
+            .with_status(500)
+            .expect(0)
+            .create_async()
+            .await;
+        let response_mock = server
+            .mock("PUT", "/response/request-id")
+            .match_header("content-type", "application/json")
+            .with_status(200)
+            .expect(1)
+            .create_async()
+            .await;
+
+        run_bridge_submit(
+            false,
+            &connector_url,
+            &request_path,
+            &request_extensions_path,
+            &proof_path,
+            &extension_responses_path,
+        )
+        .await
+        .unwrap();
+
+        no_second_fetch.assert_async().await;
+        response_mock.assert_async().await;
+        drop(server);
     }
 }

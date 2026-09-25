@@ -81,6 +81,50 @@ fn validate_extensions(extensions: &[BridgeExtension]) -> Result<()> {
     Ok(())
 }
 
+/// Parses an extension array saved by `bridge-export` or produced by an
+/// extension prover and validates every envelope before it is trusted.
+pub(super) fn parse_extensions_json(raw: &str) -> Result<Vec<BridgeExtension>> {
+    ensure!(
+        raw.len() <= MAX_BRIDGE_BODY_BYTES,
+        "bridge extension array is too large"
+    );
+    let extensions: Vec<BridgeExtension> =
+        serde_json::from_str(raw).context("parse bridge extension array")?;
+    validate_extensions(&extensions)?;
+    Ok(extensions)
+}
+
+/// Finds the one request extension whose exact payload bytes are committed as
+/// the World proof request signal.
+pub(super) fn bound_request_extension<'a>(
+    request_extensions: &'a [BridgeExtension],
+    proof_request: &CoreProofRequest,
+) -> Result<&'a BridgeExtension> {
+    validate_extensions(request_extensions)?;
+    ensure!(
+        proof_request.requests.len() == 1,
+        "composition bridge request must contain exactly one proof request item"
+    );
+    let signal = proof_request.requests[0].signal.as_deref().ok_or_else(|| {
+        eyre::eyre!(
+            "composition bridge request item must bind an extension in its signal"
+        )
+    })?;
+    let mut matching = request_extensions
+        .iter()
+        .filter(|extension| extension.payload_json.as_bytes() == signal);
+    let extension = matching.next().ok_or_else(|| {
+        eyre::eyre!(
+            "no request extension payload_json exactly matches the proof request signal"
+        )
+    })?;
+    ensure!(
+        matching.next().is_none(),
+        "multiple request extension payloads match the proof request signal"
+    );
+    Ok(extension)
+}
+
 pub(super) struct BridgeConnection {
     request_id: String,
     bridge_url: Url,
@@ -304,29 +348,7 @@ impl BridgeRequest {
         &self,
         proof_request: &CoreProofRequest,
     ) -> Result<&BridgeExtension> {
-        ensure!(
-            proof_request.requests.len() == 1,
-            "composition bridge request must contain exactly one proof request item"
-        );
-        let signal = proof_request.requests[0].signal.as_deref().ok_or_else(|| {
-            eyre::eyre!(
-                "composition bridge request item must bind an extension in its signal"
-            )
-        })?;
-        let mut matching = self
-            .request_extensions()?
-            .iter()
-            .filter(|extension| extension.payload_json.as_bytes() == signal);
-        let extension = matching.next().ok_or_else(|| {
-            eyre::eyre!(
-                "no request extension payload_json exactly matches the proof request signal"
-            )
-        })?;
-        ensure!(
-            matching.next().is_none(),
-            "multiple request extension payloads match the proof request signal"
-        );
-        Ok(extension)
+        bound_request_extension(self.request_extensions()?, proof_request)
     }
 
     pub(super) fn response_payload(
@@ -780,9 +802,40 @@ mod tests {
         wrong_version[0].version = 2;
         assert!(validate_extension_responses(&requested, &wrong_version).is_err());
 
+        let mut wrong_media_type =
+            vec![extension("example.one", "{\"proof\":1}".to_owned())];
+        wrong_media_type[0].media_type = "application/cbor".to_owned();
+        assert!(validate_extension_responses(&requested, &wrong_media_type).is_err());
+
         let wrong_name = vec![extension("example.two", "{}".to_owned())];
         assert!(validate_extension_responses(&requested, &wrong_name).is_err());
         assert!(validate_extension_responses(&requested, &[]).is_err());
+    }
+
+    #[test]
+    fn parses_and_validates_saved_request_extensions() {
+        let expected = vec![extension(
+            "org.worldcoin.passport.selective_disclosure.v1",
+            format!("{{\"issuer_schema_id\":{LARGE_SCHEMA}}}"),
+        )];
+        let encoded = serde_json::to_string(&expected).unwrap();
+        assert_eq!(parse_extensions_json(&encoded).unwrap(), expected);
+
+        let duplicate = serde_json::to_string(&[
+            extension("example.one", "{}".to_owned()),
+            extension("example.one", "[]".to_owned()),
+        ])
+        .unwrap();
+        assert!(parse_extensions_json(&duplicate).is_err());
+
+        let unknown_metadata = r#"[{
+            "name":"example.one",
+            "version":1,
+            "media_type":"application/json",
+            "payload_json":"{}",
+            "unexpected":true
+        }]"#;
+        assert!(parse_extensions_json(unknown_metadata).is_err());
     }
 
     #[test]

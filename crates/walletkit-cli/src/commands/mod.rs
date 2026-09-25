@@ -409,17 +409,38 @@ mod tests {
             "https://world.org/verify?t=wld&i=id&k=key",
             "--request",
             "request.json",
+            "--request-extensions",
+            "request-extensions.json",
             "--proof",
             "proof.json",
             "--extension-responses",
             "responses.json",
         ]);
-        assert!(matches!(
-            submit.command,
-            Command::Proof {
-                action: proof::ProofCommand::BridgeSubmit { .. }
-            }
-        ));
+        let Command::Proof {
+            action:
+                proof::ProofCommand::BridgeSubmit {
+                    request_extensions, ..
+                },
+        } = submit.command
+        else {
+            panic!("expected proof bridge-submit");
+        };
+        assert_eq!(request_extensions, PathBuf::from("request-extensions.json"));
+
+        let missing_request_extensions = Cli::try_parse_from([
+            "walletkit",
+            "proof",
+            "bridge-submit",
+            "--bridge-url",
+            "https://world.org/verify?t=wld&i=id&k=key",
+            "--request",
+            "request.json",
+            "--proof",
+            "proof.json",
+            "--extension-responses",
+            "responses.json",
+        ]);
+        assert!(missing_request_extensions.is_err());
     }
 
     #[test]

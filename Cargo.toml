@@ -30,6 +30,8 @@ alloy = { version = "2", default-features = false }
 alloy-core = { version = "1", default-features = false, features = [
   "sol-types",
 ] }
+aes-gcm = "0.10"
+ark-ff = "0.5"
 async-trait = "0.1"
 backon = "1.6"
 base64 = "0.22"
@@ -81,6 +83,7 @@ uniffi = { version = "0.32.0", features = [
   "wasm-unstable-single-threaded",
 ] }
 uuid = "1.10"
+url = "2"
 wasm-bindgen-test = "=0.3.76"
 xshell = "0.2.7"
 zeroize = "1"

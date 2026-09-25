@@ -1,6 +1,7 @@
 //! CLI command definitions and dispatch.
 
 mod auth;
+mod bridge;
 mod credential;
 mod proof;
 mod recovery_agent;
@@ -361,6 +362,80 @@ mod tests {
     fn parse_cli(args: &[&str]) -> Cli {
         Cli::try_parse_from(std::iter::once("walletkit").chain(args.iter().copied()))
             .expect("CLI should parse")
+    }
+
+    #[test]
+    fn parses_two_phase_bridge_commands() {
+        let export = parse_cli(&[
+            "proof",
+            "bridge-export",
+            "--bridge-url",
+            "https://world.org/verify?t=wld&i=id&k=key",
+            "--request-out",
+            "request.json",
+            "--proof-out",
+            "proof.json",
+            "--witness-out",
+            "witness.json",
+            "--extensions-out",
+            "extensions.json",
+            "--now",
+            "1700000000",
+        ]);
+        let Command::Proof {
+            action:
+                proof::ProofCommand::BridgeExport {
+                    request_out,
+                    proof_out,
+                    witness_out,
+                    extensions_out,
+                    now,
+                    ..
+                },
+        } = export.command
+        else {
+            panic!("expected proof bridge-export");
+        };
+        assert_eq!(request_out, PathBuf::from("request.json"));
+        assert_eq!(proof_out, PathBuf::from("proof.json"));
+        assert_eq!(witness_out, PathBuf::from("witness.json"));
+        assert_eq!(extensions_out, PathBuf::from("extensions.json"));
+        assert_eq!(now, Some(1_700_000_000));
+
+        let submit = parse_cli(&[
+            "proof",
+            "bridge-submit",
+            "--bridge-url",
+            "https://world.org/verify?t=wld&i=id&k=key",
+            "--request",
+            "request.json",
+            "--proof",
+            "proof.json",
+            "--extension-responses",
+            "responses.json",
+        ]);
+        assert!(matches!(
+            submit.command,
+            Command::Proof {
+                action: proof::ProofCommand::BridgeSubmit { .. }
+            }
+        ));
+    }
+
+    #[test]
+    fn stock_bridge_generate_requires_exactly_one_input_mode() {
+        let neither = Cli::try_parse_from(["walletkit", "proof", "generate"]);
+        assert!(neither.is_err());
+        let both = Cli::try_parse_from([
+            "walletkit",
+            "proof",
+            "generate",
+            "--request",
+            "request.json",
+            "--bridge-url",
+            "https://world.org/verify?t=wld&i=id&k=key",
+        ]);
+        assert!(both.is_err());
     }
 
     #[test]

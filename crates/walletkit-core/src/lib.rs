@@ -122,6 +122,13 @@ pub use credential::Credential;
 pub mod storage;
 
 pub mod authenticator;
+#[cfg(not(target_arch = "wasm32"))]
+mod composition_witness;
+#[cfg(not(target_arch = "wasm32"))]
+pub use composition_witness::{
+    WorldIdCompositionResultV1, WorldIdCompositionWitnessV1,
+};
+
 pub use authenticator::{
     Authenticator, GatewayRequestStatus, InitializingAuthenticator, RecoveryData,
     RecoveryUpdateSignature, RegistrationStatus,

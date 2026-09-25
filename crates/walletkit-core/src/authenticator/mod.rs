@@ -8,6 +8,7 @@ use crate::{
 use alloy_core::primitives::Address;
 use ruint::aliases::U256;
 use ruint_uniffi::Uint256;
+use sha2::{Digest as _, Sha256};
 use std::sync::Arc;
 use world_id_core::{
     api_types::{GatewayErrorCode, GatewayRequestId, GatewayRequestState},
@@ -18,6 +19,10 @@ use world_id_core::{
     OnchainKeyRepresentable, Signer,
 };
 
+#[cfg(not(target_arch = "wasm32"))]
+use crate::composition_witness::{
+    WorldIdCompositionResultV1, WorldIdCompositionWitnessV1,
+};
 use crate::requests::{ProofRequest, ProofResponse};
 use crate::storage::CredentialStore;
 use crate::OwnershipProof;
@@ -49,6 +54,175 @@ impl Authenticator {
         Ok(Self {
             inner: authenticator,
             store,
+        })
+    }
+
+    /// Load the exact active credential inputs offered to the upstream
+    /// authenticator's request-selection logic.
+    fn active_credential_inputs(
+        &self,
+        now: u64,
+    ) -> Result<Vec<CredentialInput>, WalletKitError> {
+        Ok(self
+            .store
+            .list_credentials(None, now)?
+            .iter()
+            .filter(|credential| !credential.is_expired)
+            .filter_map(|stored| {
+                if let Ok(Some((credential, blinding_factor))) =
+                    self.store.get_credential(stored.issuer_schema_id, now)
+                {
+                    Some(CredentialInput {
+                        credential: credential.into(),
+                        blinding_factor: blinding_factor.into(),
+                    })
+                } else {
+                    tracing::warn!(
+                        issuer_schema_id = %stored.issuer_schema_id,
+                        credential_id = %stored.credential_id,
+                        "credential listed but not loadable, skipping"
+                    );
+                    None
+                }
+            })
+            .collect())
+    }
+
+    /// Atomically generate the stock World proof and the private witness needed
+    /// to compose the same canonical uniqueness statement in an external
+    /// proving system.
+    ///
+    /// This follows the same credential loading, canonical request selection,
+    /// account inclusion proof, nullifier generation, and proof path used by
+    /// [`Self::generate_proof`]. The returned witness excludes the authenticator
+    /// seed and private key, but it contains sensitive, linkable credential,
+    /// account-path, and OPRF material and must remain local and short-lived.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for session involvement, constrained or multi-item
+    /// requests, anything other than one eligible active credential, a schema
+    /// mismatch, replay, invalid requests, network/proving failures, or an
+    /// unsigned stored credential.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[allow(clippy::too_many_lines)]
+    pub async fn generate_proof_with_world_composition_witness(
+        &self,
+        raw_proof_request: &[u8],
+        proof_request: &ProofRequest,
+        issuer_schema_id: u64,
+        now: u64,
+    ) -> Result<WorldIdCompositionResultV1, WalletKitError> {
+        proof_request.0.validate_proof_type()?;
+        if !proof_request.0.proof_type.is_uniqueness() {
+            return Err(WalletKitError::InvalidInput {
+                attribute: "proof_type".to_owned(),
+                reason: "composition witness v1 supports uniqueness proofs only"
+                    .to_owned(),
+            });
+        }
+        if !proof_request.0.session_id.is_none() {
+            return Err(WalletKitError::InvalidInput {
+                attribute: "session_id".to_owned(),
+                reason: "composition witness v1 does not support sessions".to_owned(),
+            });
+        }
+        if proof_request.0.constraints.is_some() || proof_request.0.requests.len() != 1
+        {
+            return Err(WalletKitError::InvalidInput {
+                attribute: "proof_request".to_owned(),
+                reason: "composition witness v1 requires one request item and no constraints"
+                    .to_owned(),
+            });
+        }
+        let eligible_count = self
+            .store
+            .list_credentials(Some(issuer_schema_id), now)?
+            .iter()
+            .filter(|credential| !credential.is_expired)
+            .count();
+        if eligible_count != 1 {
+            return Err(WalletKitError::InvalidInput {
+                attribute: "credential".to_owned(),
+                reason: format!(
+                    "composition witness v1 requires exactly one eligible credential for schema {issuer_schema_id}; found {eligible_count}"
+                ),
+            });
+        }
+        let credentials = self.active_credential_inputs(now)?;
+        let available = credentials
+            .iter()
+            .map(|input| input.credential.issuer_schema_id)
+            .collect();
+        let items_to_prove = proof_request
+            .0
+            .credentials_to_prove(&available)
+            .ok_or(AuthenticatorError::UnfullfilableRequest)?;
+        if items_to_prove.len() != 1 {
+            return Err(WalletKitError::InvalidInput {
+                attribute: "proof_request".to_owned(),
+                reason: "composition witness v1 requires canonical request selection to contain exactly one credential"
+                    .to_owned(),
+            });
+        }
+        let item = items_to_prove[0];
+        if item.issuer_schema_id != issuer_schema_id {
+            return Err(WalletKitError::InvalidInput {
+                attribute: "issuer_schema_id".to_owned(),
+                reason:
+                    "schema does not match the credential selected by the proof request"
+                        .to_owned(),
+            });
+        }
+        let credential_input = credentials
+            .iter()
+            .find(|input| input.credential.issuer_schema_id == item.issuer_schema_id)
+            .ok_or(AuthenticatorError::UnfullfilableRequest)?;
+        let inclusion_proof = self.fetch_inclusion_proof_with_cache(now).await?;
+        let nullifier = self
+            .inner
+            .generate_nullifier(&proof_request.0, now, Some(inclusion_proof.clone()))
+            .await?;
+        if self
+            .store
+            .is_nullifier_replay(nullifier.verifiable_oprf_output.output.into(), now)?
+        {
+            return Err(WalletKitError::NullifierReplay);
+        }
+        let raw_request_sha256: [u8; 32] = Sha256::digest(raw_proof_request).into();
+        let witness = WorldIdCompositionWitnessV1::from_full_oprf_output(
+            &nullifier,
+            &proof_request.0,
+            item,
+            credential_input,
+            raw_request_sha256,
+            now,
+        )
+        .map_err(|reason| WalletKitError::InvalidInput {
+            attribute: "credential".to_owned(),
+            reason,
+        })?;
+        let result = Box::pin(self.inner.generate_proof(
+            &proof_request.0,
+            nullifier.clone(),
+            &credentials,
+            Some(inclusion_proof),
+            None,
+        ))
+        .await?;
+        if result.session_id_r_seed.is_some()
+            || result.proof_response.session_id.is_some()
+        {
+            return Err(WalletKitError::Generic {
+                error: "session output produced for a session-free composition request"
+                    .to_owned(),
+            });
+        }
+        self.store
+            .replay_guard_set(nullifier.verifiable_oprf_output.output.into(), now)?;
+        Ok(WorldIdCompositionResultV1 {
+            proof_response: result.proof_response.into(),
+            witness,
         })
     }
 }
@@ -595,33 +769,9 @@ impl Authenticator {
             }
         };
 
-        // Build CredentialInput list from storage
-        // Note: We simply load all non-expired credentials. Filtering for the requested schema IDs is done in `generate_proof`.
-        // We could avoid unnecessary loading by filtering via `world_id_primitives::ProofRequest::credentials_to_prove`. We consider this an
-        // unnecessary optimization for now.
-        let credentials: Vec<_> = self
-            .store
-            .list_credentials(None, now)?
-            .iter()
-            .filter(|c| !c.is_expired)
-            .filter_map(|cred| {
-                if let Ok(Some((credential, blinding_factor))) =
-                    self.store.get_credential(cred.issuer_schema_id, now)
-                {
-                    Some(CredentialInput {
-                        credential: credential.into(),
-                        blinding_factor: blinding_factor.into(),
-                    })
-                } else {
-                    tracing::warn!(
-                        issuer_schema_id = %cred.issuer_schema_id,
-                        credential_id = %cred.credential_id,
-                        "credential listed but not loadable, skipping"
-                    );
-                    None
-                }
-            })
-            .collect();
+        // Build the same credential snapshot consumed by the composition
+        // witness exporter and upstream request-selection logic.
+        let credentials = self.active_credential_inputs(now)?;
 
         let account_inclusion_proof =
             self.fetch_inclusion_proof_with_cache(now).await?;

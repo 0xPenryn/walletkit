@@ -54,6 +54,7 @@ names, versions, and media types as the request extensions, submit both proofs:
 ```sh
 walletkit --environment staging --json proof bridge-submit \
   --bridge-url "$CONNECTOR_URL" \
+  --expected-bridge-request-id "$EXPORTED_BRIDGE_REQUEST_ID" \
   --request request.json \
   --request-extensions request-extensions.json \
   --proof world-proof.json \
@@ -66,8 +67,11 @@ does not fetch it a second time. WalletKit instead parses the owner-only
 `payload_json` byte strings to equal the World request signal, structurally
 validates the stock response against `request.json`, and rejects missing,
 extra, duplicate, or name/version/media-type-mismatched extension responses.
-It then encrypts the response with the key in the original connector URL and
-sends it directly to that connector's response endpoint:
+`EXPORTED_BRIDGE_REQUEST_ID` is the `bridge_request_id` returned by the
+`bridge-export` JSON envelope. Before making any network request, submit also
+requires that value to exactly match the request ID parsed from the connector
+URL. It then encrypts the response with the key in the original connector URL
+and sends it directly to that connector's response endpoint:
 
 ```json
 {

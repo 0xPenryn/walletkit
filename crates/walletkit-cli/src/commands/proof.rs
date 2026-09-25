@@ -101,6 +101,9 @@ pub enum ProofCommand {
         /// Original `IDKit` connector URL used by `bridge-export`.
         #[arg(long)]
         bridge_url: String,
+        /// Bridge request ID returned by `bridge-export`.
+        #[arg(long)]
+        expected_bridge_request_id: String,
         /// Owner-only exact request file written by `bridge-export`.
         #[arg(long)]
         request: PathBuf,
@@ -453,6 +456,7 @@ async fn run_bridge_export(
 async fn run_bridge_submit(
     json_output: bool,
     bridge_url: &str,
+    expected_bridge_request_id: &str,
     request_path: &Path,
     request_extensions_path: &Path,
     proof_path: &Path,
@@ -475,6 +479,10 @@ async fn run_bridge_submit(
         .wrap_err("invalid extension response array")?;
 
     let connection = BridgeConnection::parse(bridge_url)?;
+    eyre::ensure!(
+        connection.request_id() == expected_bridge_request_id,
+        "connector bridge request ID differs from the exported request ID"
+    );
     let bound_extension =
         bridge::bound_request_extension(&request_extensions, &core_request)?;
     bridge::validate_extension_responses(&request_extensions, &extension_responses)?;
@@ -801,6 +809,7 @@ pub async fn run(cli: &Cli, action: &ProofCommand) -> eyre::Result<()> {
         }
         ProofCommand::BridgeSubmit {
             bridge_url,
+            expected_bridge_request_id,
             request,
             request_extensions,
             proof,
@@ -809,6 +818,7 @@ pub async fn run(cli: &Cli, action: &ProofCommand) -> eyre::Result<()> {
             run_bridge_submit(
                 cli.json,
                 bridge_url,
+                expected_bridge_request_id,
                 request,
                 request_extensions,
                 proof,
@@ -988,6 +998,7 @@ mod tests {
         run_bridge_submit(
             false,
             &connector_url,
+            "request-id",
             &request_path,
             &request_extensions_path,
             &proof_path,
@@ -997,6 +1008,22 @@ mod tests {
         .unwrap();
 
         no_second_fetch.assert_async().await;
+        response_mock.assert_async().await;
+
+        let mismatch = run_bridge_submit(
+            false,
+            &connector_url,
+            "different-request-id",
+            &request_path,
+            &request_extensions_path,
+            &proof_path,
+            &extension_responses_path,
+        )
+        .await
+        .expect_err("a connector for another bridge request must fail closed");
+        assert!(mismatch
+            .to_string()
+            .contains("connector bridge request ID differs"));
         response_mock.assert_async().await;
         drop(server);
     }

@@ -407,6 +407,8 @@ mod tests {
             "bridge-submit",
             "--bridge-url",
             "https://world.org/verify?t=wld&i=id&k=key",
+            "--expected-bridge-request-id",
+            "id",
             "--request",
             "request.json",
             "--request-extensions",
@@ -419,13 +421,33 @@ mod tests {
         let Command::Proof {
             action:
                 proof::ProofCommand::BridgeSubmit {
-                    request_extensions, ..
+                    expected_bridge_request_id,
+                    request_extensions,
+                    ..
                 },
         } = submit.command
         else {
             panic!("expected proof bridge-submit");
         };
         assert_eq!(request_extensions, PathBuf::from("request-extensions.json"));
+        assert_eq!(expected_bridge_request_id, "id");
+
+        let missing_expected_bridge_request_id = Cli::try_parse_from([
+            "walletkit",
+            "proof",
+            "bridge-submit",
+            "--bridge-url",
+            "https://world.org/verify?t=wld&i=id&k=key",
+            "--request",
+            "request.json",
+            "--request-extensions",
+            "request-extensions.json",
+            "--proof",
+            "proof.json",
+            "--extension-responses",
+            "responses.json",
+        ]);
+        assert!(missing_expected_bridge_request_id.is_err());
 
         let missing_request_extensions = Cli::try_parse_from([
             "walletkit",
@@ -433,6 +455,8 @@ mod tests {
             "bridge-submit",
             "--bridge-url",
             "https://world.org/verify?t=wld&i=id&k=key",
+            "--expected-bridge-request-id",
+            "id",
             "--request",
             "request.json",
             "--proof",

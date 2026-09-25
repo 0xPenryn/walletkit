@@ -906,8 +906,7 @@ mod tests {
         assert!(!path.exists());
     }
 
-    #[tokio::test]
-    async fn bridge_submit_uses_saved_extensions_without_refetching() {
+    fn bridge_submit_fixture() -> (tempfile::TempDir, [PathBuf; 4]) {
         let payload_json = r#"{"policy":"age_at_least"}"#;
         let request = build_test_request(
             &TestEnv::default_staging(),
@@ -970,6 +969,24 @@ mod tests {
             ),
         ])
         .unwrap();
+
+        (
+            directory,
+            [
+                request_path,
+                request_extensions_path,
+                proof_path,
+                extension_responses_path,
+            ],
+        )
+    }
+
+    #[tokio::test]
+    async fn bridge_submit_uses_saved_extensions_without_refetching() {
+        let (
+            _directory,
+            [request_path, request_extensions_path, proof_path, extension_responses_path],
+        ) = bridge_submit_fixture();
 
         let key = STANDARD.encode([0x22; 32]);
         let mut server = mockito::Server::new_async().await;
